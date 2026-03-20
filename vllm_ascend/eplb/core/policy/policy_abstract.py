@@ -39,3 +39,6 @@ class EplbPolicy:
         [252, 253, 254, 255, 0]
         """
         pass
+
+    def set_new_ep_size(self, new_ep_size):
+        pass
