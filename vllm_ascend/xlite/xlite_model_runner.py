@@ -27,7 +27,7 @@ class XliteModelRunner(NPUModelRunner):
         """See :meth:`NPUModelRunner.get_model` and :meth:`XliteWrapper.unwrap` for details."""
         return self.model.unwrap()
 
-    def load_model(self) -> None:
+    def load_model(self, load_dummy_weights=False) -> None:
         from vllm_ascend.xlite.xlite import XliteWrapper
 
         super().load_model()

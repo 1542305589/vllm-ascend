@@ -19,10 +19,11 @@ import json
 from typing import Any
 
 import torch
-import torch.distributed as dist
+import torch_npu
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.parallel_state import get_dynamic_eplb_group
 from vllm_ascend.quantization.methods.base import QuantType
 
 
@@ -35,8 +36,8 @@ class VllmEplbAdaptor:
         else:
             self.model = model
             self.config = model.config
-        self.rank_id = dist.get_rank()
-        self.world_size = dist.get_world_size()
+        self.rank_id = get_dynamic_eplb_group().rank_in_group
+        self.world_size = get_dynamic_eplb_group().world_size
         self.num_dense_layers = getattr(self.config, "first_k_dense_replace", 0)
         self.num_moe_layers = self.config.num_hidden_layers - self.num_dense_layers
 
