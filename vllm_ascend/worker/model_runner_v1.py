@@ -1412,8 +1412,8 @@ class NPUModelRunner(GPUModelRunner):
         # Initialize a new stream to overlap the copy operation with
         # prepare_input of draft model.
         default_stream = torch.npu.current_stream()
-        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):  
-            self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  
+        with torch.npu.stream(self.valid_sampled_token_count_copy_stream):
+            self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)
             counts = valid_sampled_tokens_count
             counts_cpu = self.valid_sampled_token_count_cpu
             assert counts_cpu is not None
@@ -3416,8 +3416,7 @@ class NPUModelRunner(GPUModelRunner):
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             if load_dummy_weights:
                 self.load_config.load_format = "dummy"
-            self.model = get_model(vllm_config=self.vllm_config, load_config=self.load_config)
-            self.model: nn.Module = get_model(vllm_config=self.vllm_config)
+            self.model: nn.Module = get_model(vllm_config=self.vllm_config, load_config=self.load_config)
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
