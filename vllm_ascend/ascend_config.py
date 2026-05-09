@@ -273,6 +273,10 @@ class AscendConfig:
         self.sparse_json = self.hamming_sparse["sparse_json_location"]
         self._check_enable_hamming_sparse()
 
+        if vllm_config.parallel_config.enable_elastic_ep:
+            if get_ascend_device_type() != AscendDeviceType.A3:
+                raise ValueError("Elastic EP is only supported on A3.")
+
     @staticmethod
     def _get_config_value(additional_config: dict[str, Any], config_key: str, env_key: str, env_value: Any) -> Any:
         if config_key in additional_config:

@@ -1,9 +1,9 @@
 import threading
 from contextlib import contextmanager
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-import vllm.distributed.stateless_coordinator as vllm_distributed_stateless_mod
 from torch.distributed import ProcessGroup, Store
 from torch.distributed.distributed_c10d import BackendConfig, _world
 from vllm.distributed.parallel_state import GroupCoordinator, get_dp_group
@@ -66,20 +66,21 @@ def stateless_init_pg_with_world_registration(**kwargs) -> ProcessGroup | tuple[
     else:
         pg = stateless_init_torch_distributed_process_group(**kwargs)
 
-    backend = "hccl"
-    prefix_store = pg.get_group_store()
-    group_name = pg.group_name
-    backend_config = BackendConfig(backend)
+    if kwargs["backend"] == "hccl":
+        backend = "hccl"
+        prefix_store = pg.get_group_store()
+        group_name = pg.group_name
+        backend_config = BackendConfig(backend)
 
-    # Register process group to PyTorch's global _world state
-    # Required for: dist.P2POp, dist.batch_isend_irecv, and other ops that query _world.pg_map
-    _world.pg_group_ranks[pg] = {i: i for i in range(pg.size())}
-    _world.pg_map[pg] = (backend, prefix_store)
-    _world.pg_names[pg] = group_name
-    _world.pg_backend_config[pg] = str(backend_config)
+        # Register process group to PyTorch's global _world state
+        # Required for: dist.P2POp, dist.batch_isend_irecv, and other ops that query _world.pg_map
+        _world.pg_group_ranks[pg] = {i: i for i in range(pg.size())}
+        _world.pg_map[pg] = (backend, prefix_store)
+        _world.pg_names[pg] = group_name
+        _world.pg_backend_config[pg] = str(backend_config)
 
-    if "WORLD" in group_name:
-        _world.default_pg = pg
+        if "WORLD" in group_name:
+            _world.default_pg = pg
 
     if kwargs.get("return_store", False):
         return pg, store
@@ -103,20 +104,18 @@ _PATCH_LOCK = threading.Lock()
 
 @contextmanager
 def use_stateless_pg_with_world_registration():
-    with _PATCH_LOCK:
-        old_init_impl = stateless_init_torch_distributed_process_group
-        old_destroy_impl = stateless_destroy_torch_distributed_process_group
-        vllm_distributed_stateless_mod.stateless_init_torch_distributed_process_group = (
-            stateless_init_pg_with_world_registration
-        )
-        vllm_distributed_stateless_mod.stateless_destroy_torch_distributed_process_group = (
-            stateless_destroy_pg_with_world_cleanup
-        )
-        try:
-            yield
-        finally:
-            vllm_distributed_stateless_mod.stateless_init_torch_distributed_process_group = old_init_impl
-            vllm_distributed_stateless_mod.stateless_destroy_torch_distributed_process_group = old_destroy_impl
+    with (
+        _PATCH_LOCK,
+        patch(
+            "vllm.distributed.stateless_coordinator.stateless_init_torch_distributed_process_group",
+            new=stateless_init_pg_with_world_registration,
+        ),
+        patch(
+            "vllm.distributed.stateless_coordinator.stateless_destroy_torch_distributed_process_group",
+            new=stateless_destroy_pg_with_world_cleanup,
+        ),
+    ):
+        yield
 
 
 def split_tensor_along_first_dim(

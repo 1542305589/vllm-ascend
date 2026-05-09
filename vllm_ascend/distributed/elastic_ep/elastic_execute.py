@@ -35,32 +35,36 @@
 
 import copy
 import gc
+import os
 import threading
 from collections.abc import Iterable, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from unittest.mock import patch
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch_npu
-import vllm.distributed.elastic_ep.elastic_execute as elastic_execute_mod
 from torch.distributed import P2POp
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.wrapper import reset_compile_wrapper
 from vllm.config import (
     CompilationMode,
-    set_current_vllm_config,
+    set_current_vllm_config, CUDAGraphMode,
 )
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
     get_pcp_group,
     get_tp_group,
+    ensure_model_parallel_initialized,
+    destroy_model_parallel,
 )
 from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
     get_standby_dp_group,
+    get_standby_ep_group,
     pop_standby_groups,
 )
 from vllm.distributed.parallel_state import _replace_active_groups
@@ -72,12 +76,14 @@ from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.workspace import lock_workspace, unlock_workspace
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, reset_graph_params
 from vllm_ascend.distributed.elastic_ep.standby_state import (
     create_ascend_standby_groups,
     pop_ascend_standby_groups,
 )
 from vllm_ascend.distributed.parallel_state import (
+    init_ascend_model_parallel,
+    destroy_ascend_model_parallel,
     _replace_ascend_active_groups,
     get_dynamic_eplb_group,
     get_mc2_group,
@@ -187,12 +193,10 @@ def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
 class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
     @contextmanager
     def _use_ascend_transfer_impl(self):
-        old_impl = elastic_execute_mod.batch_transfer_weights
-        elastic_execute_mod.batch_transfer_weights = ascend_batch_transfer_weights
-        try:
+        with patch(
+            "vllm.distributed.elastic_ep.elastic_execute.batch_transfer_weights", new=ascend_batch_transfer_weights
+        ):
             yield
-        finally:
-            elastic_execute_mod.batch_transfer_weights = old_impl
 
     def load_model(self) -> None:
         (
@@ -259,11 +263,29 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         with set_current_vllm_config(self.worker.vllm_config):
             reset_compile_wrapper(self.worker.model_runner.get_model())
 
+        capture_descs = self.worker.model_runner.cudagraph_dispatcher.get_capture_descs()
+        capture_sizes = sorted({
+            desc.num_tokens
+            for _, descs in capture_descs
+            for desc in descs
+        })
+
+        reset_graph_params(
+            capture_sizes,
+            self.worker.model_runner.use_aclgraph,
+            self.worker.model_runner.speculative_config,
+        )
+
         gc.collect()
         torch.npu.synchronize()
         torch.npu.empty_cache()
 
     def switch_and_remove(self) -> None:
+        if not self.worker.model_config.enforce_eager and \
+                self.worker.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            with use_stateless_pg_with_world_registration():
+                destroy_ascend_model_parallel()
+                destroy_model_parallel()
         self._release_acl_graphs()
         with use_stateless_pg_with_world_registration():
             _replace_active_groups(world=None, dp=None, ep=None, eplb=None, node_count=None)
@@ -273,18 +295,48 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         old_ep_size = get_ep_group().world_size
         self.worker.model_runner.shared_dict["old_ep_size"] = old_ep_size
 
+        if not self.worker.model_config.enforce_eager and \
+                self.worker.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            with use_stateless_pg_with_world_registration():
+                destroy_model_parallel()
+                destroy_ascend_model_parallel()
+
         self._release_acl_graphs()
-        with use_stateless_pg_with_world_registration():
-            _replace_active_groups(**pop_standby_groups())
-            _replace_ascend_active_groups(**pop_ascend_standby_groups())
 
         parallel_config = self.worker.vllm_config.parallel_config
         reconfig_request = self.reconfig_request
         assert reconfig_request is not None
         new_dp_size = reconfig_request.new_data_parallel_size
-        new_ep_size = get_ep_group().world_size
-
+        new_ep_size = get_standby_ep_group().world_size
         parallel_config.data_parallel_size = new_dp_size
+
+        if self.worker.model_config.enforce_eager or \
+                self.worker.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+            with use_stateless_pg_with_world_registration():
+                _replace_active_groups(**pop_standby_groups())
+                _replace_ascend_active_groups(**pop_ascend_standby_groups())
+        else:
+            stateless_groups = pop_standby_groups() | pop_ascend_standby_groups()
+            _replace_active_groups(world=stateless_groups["world"], dp=None, ep=None, eplb=None,
+                                   node_count=stateless_groups["node_count"])
+            def patched_init_stateless_group(*args, **kwargs):
+                if len(args) >= 2:
+                    group_name = args[1]
+                else:
+                    group_name = kwargs["group_name"]
+                if group_name in ["dp", "ep", "eplb", "mc2", "dynamic_eplb", "fc3_quant_x"]:
+                    return stateless_groups[group_name]
+
+            with patch("vllm.distributed.parallel_state._init_stateless_group", patched_init_stateless_group), \
+                 patch("vllm_ascend.distributed.parallel_state._init_stateless_group", patched_init_stateless_group):
+                with set_current_vllm_config(self.worker.vllm_config):
+                    ensure_model_parallel_initialized(
+                        self.worker.parallel_config.tensor_parallel_size,
+                        self.worker.parallel_config.pipeline_parallel_size,
+                        self.worker.parallel_config.prefill_context_parallel_size,
+                        self.worker.parallel_config.decode_context_parallel_size,
+                    )
+                    init_ascend_model_parallel(self.worker.parallel_config)
 
         if reconfig_request.new_data_parallel_rank != ReconfigureRankType.KEEP_CURRENT_RANK:
             parallel_config.data_parallel_rank = reconfig_request.new_data_parallel_rank
@@ -305,7 +357,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
             "All MoE modules must have the same number of experts"
         )
         for module in moe_modules:
-            # module.local_num_experts = module.w2_weight.shape[0]
             num_logical_experts = self.worker.model_runner.shared_dict["expert_maps"].shape[-1]
             module.global_redundant_expert_num = module.local_num_experts * new_ep_size - num_logical_experts
             module.moe_config.num_experts = num_local_experts * new_ep_size

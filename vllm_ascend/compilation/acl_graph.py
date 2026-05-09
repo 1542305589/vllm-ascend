@@ -15,7 +15,7 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphOptions
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig, SpeculativeConfig
 from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import logger
 from vllm.platforms import current_platform
@@ -120,20 +120,15 @@ class ACLGraphWrapper:
             raise AttributeError(
                 f"Attribute {key} not exists in the runnable of aclgraph wrapper: {self._runnable_str}"
             )
-        raise AttributeError(f"Attribute {key} not found. Set VLLM_LOGGING_LEVEL=DEBUG for more details.")
+        raise AttributeError(f"Attribute {key} not foundA. Set VLLM_LOGGING_LEVEL=DEBUG for more details.")
 
     def unwrap(self) -> Callable:
         # in case we need to access the original runnable.
         return self.runnable
 
     def clear_graphs(self) -> None:
-        for batch_descriptor in self.concrete_aclgraph_entries:
-            entry = self.concrete_aclgraph_entries[batch_descriptor]
-            assert entry.aclgraph is not None
-            entry.aclgraph.reset()
-            del entry.aclgraph, entry.batch_descriptor, entry.output, entry.input_addresses, entry
         self.concrete_aclgraph_entries.clear()
-        self.graph_pool = ACLGraphWrapper._graph_pool
+        self.graph_pool = ACLGraphWrapper.get_graph_pool()
 
     def __call__(self, *args, **kwargs):
         forward_context = get_forward_context()
@@ -379,3 +374,16 @@ def update_draft_graph_prefill_params_workspaces(num_tokens: int, workspace: Any
 
 def get_draft_graph_prefill_params():
     return _draft_graph_prefill_params
+
+def reset_graph_params(
+    capture_sizes: list[int],
+    use_aclgraph: bool,
+    speculative_config: SpeculativeConfig,
+):
+    global _graph_params, _draft_graph_params
+    _graph_params = None
+    _draft_graph_params = None
+    if use_aclgraph:
+        set_graph_params(capture_sizes)
+        if speculative_config:
+            set_draft_graph_params(capture_sizes)

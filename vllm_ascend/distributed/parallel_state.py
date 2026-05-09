@@ -172,6 +172,7 @@ def init_ascend_model_parallel(
             return None
         if group_size not in _group_cache:
             rank_grid = torch.arange(world_size).reshape(global_pp_size, global_dp_size, global_tp_size)
+            assert global_dp_size % group_size == 0 and global_dp_size >= group_size
             num_chunks = global_dp_size // group_size
             group_ranks = []
             for pp_idx in range(global_pp_size):
@@ -213,10 +214,11 @@ def init_ascend_model_parallel(
         _FLASHCOMM2_ODP = get_tp_group()
 
         if flashcomm2_otp_size > 1:
+            dp_size = 1 if enable_elastic_ep else global_dp_size
             odp_group_ranks: list[list[int]] = [
-                [] for _ in range(flashcomm2_otp_size * global_dp_size * global_pp_size)
+                [] for _ in range(flashcomm2_otp_size * dp_size * global_pp_size)
             ]
-            for dp_group_index in range(global_dp_size):
+            for dp_group_index in range(dp_size):
                 for pp_group_index in range(global_pp_size):
                     dp_pp_serial_index = dp_group_index * global_pp_size + pp_group_index
                     tp_base_rank = dp_pp_serial_index * global_tp_size
