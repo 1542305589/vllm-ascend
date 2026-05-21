@@ -17,6 +17,8 @@
 from enum import Enum
 
 import torch.distributed as dist
+import torch_npu
+
 from vllm.logger import logger
 from vllm.v1.utils import record_function_or_nullcontext
 
@@ -53,23 +55,16 @@ class D2DExpertWeightLoader:
 
         self.layer_id = layer_id
         self.comm_op_list = []
-        has_send_buffer = set()
         for send_info in expert_send_info:
             dst_rank, global_expert_id_to_send = send_info
             local_expert_id = self.eplb_adaptor.expert_map_per_layer_cpu[layer_id][global_expert_id_to_send].item()
             for index, src_tensor in enumerate(self.eplb_adaptor.expert_param_per_layer[layer_id][local_expert_id]):
-                # Use the pre-allocated send buffer if available (for non-quantized fused MC2).
-                # Since the communication library requires a memory offset of 0, we copy the
-                # source tensor to this buffer to ensure the requirement is met.
-                if send_buffer_tensor_list := getattr(self.eplb_adaptor, "send_buffer_tensor_list", None):
-                    if local_expert_id not in has_send_buffer:
-                        # Only copy once per expert per weight to avoid redundant operations
-                        send_buffer_tensor_list[local_expert_id][index].copy_(src_tensor)
-                    src_tensor = send_buffer_tensor_list[local_expert_id][index]
+                trans_nd = self.eplb_adaptor.weight_trans_nd[index]
+                if trans_nd:
+                    src_tensor = torch_npu.npu_format_cast(src_tensor, 2)
                 self.comm_op_list.append(
                     dist.P2POp(dist.isend, src_tensor, dst_rank, group=self.comm_group.device_group)
                 )
-            has_send_buffer.add(local_expert_id)
 
         for buffer_tensor_id, recv_info in enumerate(expert_recv_info):
             recv_rank, global_expert_id_to_recv = recv_info

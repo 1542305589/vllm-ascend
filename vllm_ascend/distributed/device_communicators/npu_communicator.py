@@ -47,9 +47,9 @@ class NPUCommunicator(DeviceCommunicatorBase):
         from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
 
         self.pyhccl_comm: PyHcclCommunicator | None = None
-        if self.world_size > 1:
+        if self.world_size > 1 and tcp_store_group is not None:
             self.pyhccl_comm = PyHcclCommunicator(
-                group=self.cpu_group if tcp_store_group is None else tcp_store_group, device=self.device
+                group=tcp_store_group, device=self.device
             )
 
         # For compatibility (mainly for reusing graph capturing code in vllm),
@@ -85,6 +85,34 @@ class NPUCommunicator(DeviceCommunicatorBase):
         dist.all_to_all(output_list, input_list, group=self.device_group)
         output_tensor = torch.cat(output_list, dim=gather_dim).contiguous()
         return output_tensor
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if self.pyhccl_comm is not None:
+            if dim < 0:
+                # Convert negative dim to positive.
+                dim += input_.dim()
+            input_size = input_.size()
+            # NOTE: we have to use concat-style all-gather here,
+            # stack-style all-gather has compatibility issues with
+            # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
+            output_size = (input_size[0] * self.world_size,) + input_size[1:]
+            # Allocate output tensor.
+            output_tensor = torch.empty(
+                output_size, dtype=input_.dtype, device=input_.device
+            )
+            # All-gather.
+            output_tensor = self.pyhccl_comm.all_gather(input_, output_tensor)
+            # Reshape
+            output_tensor = output_tensor.reshape((self.world_size,) + input_size)
+            output_tensor = output_tensor.movedim(0, dim)
+            output_tensor = output_tensor.reshape(
+                input_size[:dim]
+                + (self.world_size * input_size[dim],)
+                + input_size[dim + 1:]
+            )
+            return output_tensor
+        else:
+            return super().all_gather(input_, dim)
 
     def destroy(self):
         if self.pyhccl_comm is not None:

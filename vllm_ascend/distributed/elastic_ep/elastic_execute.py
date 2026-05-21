@@ -90,6 +90,7 @@ from vllm_ascend.distributed.parallel_state import (
 )
 from vllm_ascend.distributed.utils import use_stateless_pg_with_world_registration
 from vllm_ascend.ops.fused_moe.moe_comm_method import setup_moe_comm_method
+from vllm_ascend.quantization.methods import AscendW4A8DynamicFusedMoEMethod
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicFusedMoEMethod
 
 _PATCH_LOCK = threading.Lock()
@@ -177,7 +178,8 @@ def broadcast_expert_mapping(
 
 
 def setup_moe_comm_and_quant_method(module: nn.Module) -> None:
-    if isinstance(quant_method := getattr(module.quant_method, "quant_method", None), AscendW8A8DynamicFusedMoEMethod):
+    if isinstance(quant_method := getattr(module.quant_method, "quant_method", None),
+                  (AscendW8A8DynamicFusedMoEMethod, AscendW4A8DynamicFusedMoEMethod)):
         quant_method.ep_group = get_ep_group()
         try:
             device_group = get_mc2_group().device_group
@@ -281,11 +283,6 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         torch.npu.empty_cache()
 
     def switch_and_remove(self) -> None:
-        if not self.worker.model_config.enforce_eager and \
-                self.worker.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            with use_stateless_pg_with_world_registration():
-                destroy_ascend_model_parallel()
-                destroy_model_parallel()
         self._release_acl_graphs()
         with use_stateless_pg_with_world_registration():
             _replace_active_groups(world=None, dp=None, ep=None, eplb=None, node_count=None)
@@ -295,48 +292,18 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         old_ep_size = get_ep_group().world_size
         self.worker.model_runner.shared_dict["old_ep_size"] = old_ep_size
 
-        if not self.worker.model_config.enforce_eager and \
-                self.worker.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            with use_stateless_pg_with_world_registration():
-                destroy_model_parallel()
-                destroy_ascend_model_parallel()
-
         self._release_acl_graphs()
 
         parallel_config = self.worker.vllm_config.parallel_config
         reconfig_request = self.reconfig_request
         assert reconfig_request is not None
         new_dp_size = reconfig_request.new_data_parallel_size
-        new_ep_size = get_standby_ep_group().world_size
+        new_ep_size = get_ep_group().world_size
         parallel_config.data_parallel_size = new_dp_size
 
-        if self.worker.model_config.enforce_eager or \
-                self.worker.vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
-            with use_stateless_pg_with_world_registration():
-                _replace_active_groups(**pop_standby_groups())
-                _replace_ascend_active_groups(**pop_ascend_standby_groups())
-        else:
-            stateless_groups = pop_standby_groups() | pop_ascend_standby_groups()
-            _replace_active_groups(world=stateless_groups["world"], dp=None, ep=None, eplb=None,
-                                   node_count=stateless_groups["node_count"])
-            def patched_init_stateless_group(*args, **kwargs):
-                if len(args) >= 2:
-                    group_name = args[1]
-                else:
-                    group_name = kwargs["group_name"]
-                if group_name in ["dp", "ep", "eplb", "mc2", "dynamic_eplb", "fc3_quant_x"]:
-                    return stateless_groups[group_name]
-
-            with patch("vllm.distributed.parallel_state._init_stateless_group", patched_init_stateless_group), \
-                 patch("vllm_ascend.distributed.parallel_state._init_stateless_group", patched_init_stateless_group):
-                with set_current_vllm_config(self.worker.vllm_config):
-                    ensure_model_parallel_initialized(
-                        self.worker.parallel_config.tensor_parallel_size,
-                        self.worker.parallel_config.pipeline_parallel_size,
-                        self.worker.parallel_config.prefill_context_parallel_size,
-                        self.worker.parallel_config.decode_context_parallel_size,
-                    )
-                    init_ascend_model_parallel(self.worker.parallel_config)
+        with use_stateless_pg_with_world_registration():
+            _replace_active_groups(**pop_standby_groups())
+            _replace_ascend_active_groups(**pop_ascend_standby_groups())
 
         if reconfig_request.new_data_parallel_rank != ReconfigureRankType.KEEP_CURRENT_RANK:
             parallel_config.data_parallel_rank = reconfig_request.new_data_parallel_rank
