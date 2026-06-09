@@ -298,7 +298,7 @@ class AscendElasticEPScalingExecutor(ElasticEPScalingExecutor):
         reconfig_request = self.reconfig_request
         assert reconfig_request is not None
         new_dp_size = reconfig_request.new_data_parallel_size
-        new_ep_size = get_ep_group().world_size
+        new_ep_size = get_standby_ep_group().world_size
         parallel_config.data_parallel_size = new_dp_size
 
         with use_stateless_pg_with_world_registration():
