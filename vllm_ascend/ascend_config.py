@@ -17,6 +17,7 @@ import json
 import os
 from typing import TYPE_CHECKING, Any
 
+from vllm import envs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
@@ -318,6 +319,25 @@ class AscendConfig:
             additional_config.get("sparse_kv_offload_config", {}),
         )
         self._validate_sparse_c8_kv_offload_compatibility()
+
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.enable_elastic_ep:
+            from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+            if get_ascend_device_type() != AscendDeviceType.A3:
+                raise ValueError("Elastic EP is only supported on A3.")
+
+            if self.eplb_config.dynamic_eplb:
+                raise RuntimeError(
+                    "Elastic EP with dynamic_eplb=True is temporarily unsupported. "
+                    "Set dynamic_eplb=False in eplb_config to use Elastic EP."
+                    "Or use EPLB in ModelRunnerV2 instead."
+                )
+
+            if self.eplb_config.num_redundant_experts > 0:
+                parallel_config.eplb_config.num_redundant_experts = (
+                    self.eplb_config.num_redundant_experts
+                )
 
     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
         if self.sparse_kv_offload_config.enabled and self.enable_sparse_sfa_c8:
